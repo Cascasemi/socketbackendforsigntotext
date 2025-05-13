@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sign2Text - Client Webcam</title>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #1a237e;
+            text-align: center;
+        }
+        .video-container {
+            position: relative;
+            width: 100%;
+            margin: 20px 0;
+        }
+        #webcam {
+            width: 100%;
+            border-radius: 8px;
+            display: block;
+        }
+        #canvas {
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+        }
+        .results {
+            background: #f0f0f0;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 20px 0;
+            text-align: center;
+        }
+        #translatedText {
+            font-size: 28px;
+            font-weight: bold;
+            color: #1a237e;
+            margin: 10px 0;
+        }
+        #confidence {
+            color: #666;
+            font-size: 16px;
+        }
+        .controls {
+            display: flex;
+            justify-content: center;
+            gap: 15px;
+            margin-top: 20px;
+        }
+        button {
+            padding: 10px 20px;
+            background: #1a237e;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:disabled {
+            background: #cccccc;
+            cursor: not-allowed;
+        }
+        .status {
+            padding: 10px;
+            background: #e0e0e0;
+            border-radius: 4px;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        .status.connected {
+            background: #c8e6c9;
+        }
+        .status.error {
+            background: #ffcdd2;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Sign Language to Text Translator</h1>
+
+        <div id="status" class="status">
+            Initializing...
+        </div>
+
+        <div class="video-container">
+            <video id="webcam" playsinline></video>
+            <canvas id="canvas"></canvas>
+        </div>
+
+        <div class="results">
+            <div id="translatedText">Make a sign in view of the camera</div>
+            <div id="confidence"></div>
+        </div>
+
+        <div class="controls">
+            <button id="startBtn">Start</button>
+            <button id="resetBtn" disabled>Reset</button>
+            <button id="speakBtn" disabled>Speak</button>
+        </div>
+    </div>
+
+    <script>
+        // DOM elements
+        const statusDiv = document.getElementById('status');
+        const videoElement = document.getElementById('webcam');
+        const canvasElement = document.getElementById('canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const translatedText = document.getElementById('translatedText');
+        const confidence = document.getElementById('confidence');
+        const startBtn = document.getElementById('startBtn');
+        const resetBtn = document.getElementById('resetBtn');
+        const speakBtn = document.getElementById('speakBtn');
+
+        // Socket.IO connection
+        const socket = io('https://socketbackendforsigntotext-1.onrender.com', {
+            reconnection: true,
+            reconnectionAttempts: 5,
+            reconnectionDelay: 1000
+        });
+
+        // MediaPipe Hands
+        let hands;
+        let lastVideoTime = -1;
+        let animationId;
+        let isProcessing = false;
+
+        // Initialize the app
+        async function init() {
+            try {
+                // Initialize MediaPipe Hands
+                hands = new Hands({
+                    locateFile: (file) => {
+                        return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+                    }
+                });
+
+                hands.setOptions({
+                    maxNumHands: 2,
+                    modelComplexity: 1,
+                    minDetectionConfidence: 0.5,
+                    minTrackingConfidence: 0.5
+                });
+
+                hands.onResults(onHandsResults);
+
+                // Set up socket events
+                setupSocketEvents();
+
+                // Set up button events
+                startBtn.addEventListener('click', startWebcam);
+                resetBtn.addEventListener('click', resetTranslation);
+                speakBtn.addEventListener('click', speakText);
+
+                statusDiv.textContent = 'Ready to start';
+                statusDiv.className = 'status';
+
+            } catch (error) {
+                console.error('Initialization error:', error);
+                statusDiv.textContent = `Error: ${error.message}`;
+                statusDiv.className = 'status error';
+            }
+        }
+
+        // Set up socket events
+        function setupSocketEvents() {
+            socket.on('connect', () => {
+                statusDiv.textContent = 'Connected to server';
+                statusDiv.className = 'status connected';
+            });
+
+            socket.on('disconnect', () => {
+                statusDiv.textContent = 'Disconnected from server';
+                statusDiv.className = 'status';
+            });
+
+            socket.on('connect_error', (error) => {
+                statusDiv.textContent = `Connection error: ${error.message}`;
+                statusDiv.className = 'status error';
+            });
+
+            socket.on('prediction', (data) => {
+                if (data.error) {
+                    translatedText.textContent = `Error: ${data.error}`;
+                    confidence.textContent = '';
+                } else {
+                    translatedText.textContent = data.text;
+                    confidence.textContent = `Confidence: ${(data.confidence * 100).toFixed(1)}%`;
+                    speakBtn.disabled = false;
+                }
+                isProcessing = false;
+            });
+        }
+
+        // Start webcam
+        async function startWebcam() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        facingMode: 'user',
+                        width: 640,
+                        height: 480
+                    },
+                    audio: false
+                });
+
+                videoElement.srcObject = stream;
+                startBtn.disabled = true;
+                resetBtn.disabled = false;
+                statusDiv.textContent = 'Webcam started - detecting hands';
+                statusDiv.className = 'status connected';
+
+                // Start processing frames
+                await new Promise((resolve) => {
+                    videoElement.onloadedmetadata = () => {
+                        canvasElement.width = videoElement.videoWidth;
+                        canvasElement.height = videoElement.videoHeight;
+                        resolve();
+                    };
+                });
+
+                processFrame();
+
+            } catch (error) {
+                console.error('Webcam error:', error);
+                statusDiv.textContent = `Webcam error: ${error.message}`;
+                statusDiv.className = 'status error';
+            }
+        }
+
+        // Process each frame
+        async function processFrame() {
+            if (videoElement.readyState < 2) {
+                await new Promise((resolve) => {
+                    videoElement.onloadeddata = () => {
+                        resolve();
+                    };
+                });
+            }
+
+            // Skip if we're still processing the last frame
+            if (isProcessing) {
+                animationId = requestAnimationFrame(processFrame);
+                return;
+            }
+
+            // Only process if video has advanced
+            if (videoElement.currentTime !== lastVideoTime) {
+                lastVideoTime = videoElement.currentTime;
+                await hands.send({image: videoElement});
+            }
+
+            animationId = requestAnimationFrame(processFrame);
+        }
+
+        // Handle hand detection results
+        function onHandsResults(results) {
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            canvasCtx.drawImage(
+                results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+            if (results.multiHandLandmarks && !isProcessing) {
+                // Draw landmarks
+                for (const landmarks of results.multiHandLandmarks) {
+                    drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, {
+                        color: '#00FF00',
+                        lineWidth: 2
+                    });
+                    drawLandmarks(canvasCtx, landmarks, {
+                        color: '#FF0000',
+                        lineWidth: 1
+                    });
+                }
+
+                // Prepare and send data to server
+                const landmarksData = results.multiHandLandmarks[0].map(lm => ({
+                    x: lm.x,
+                    y: lm.y
+                }));
+
+                isProcessing = true;
+                socket.emit('frame_data', {
+                    landmarks: landmarksData
+                });
+            }
+
+            canvasCtx.restore();
+        }
+
+        // Reset translation
+        function resetTranslation() {
+            translatedText.textContent = 'Make a sign in view of the camera';
+            confidence.textContent = '';
+            speakBtn.disabled = true;
+        }
+
+        // Speak the translated text
+        function speakText() {
+            if (translatedText.textContent && !translatedText.textContent.startsWith('Make a sign')) {
+                const utterance = new SpeechSynthesisUtterance(translatedText.textContent);
+                utterance.rate = 0.8;
+                speechSynthesis.speak(utterance);
+            }
+        }
+
+        // Clean up on page unload
+        window.addEventListener('beforeunload', () => {
+            if (videoElement.srcObject) {
+                videoElement.srcObject.getTracks().forEach(track => track.stop());
+            }
+            if (animationId) {
+                cancelAnimationFrame(animationId);
+            }
+            if (hands) {
+                hands.close();
+            }
+        });
+
+        // Initialize the app
+        init();
+    </script>
+</body>
+</html>
