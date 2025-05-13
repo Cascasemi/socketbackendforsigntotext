@@ -1,9 +1,12 @@
+eventlet
 flask
 flask-socketio
-eventlet
+flask-cors
 opencv-python
 mediapipe
 numpy
-python-dotenv
+scikit-lear
 gunicorn
-flask-cors
+python-dotenv
+werkzeug
+protobuf
