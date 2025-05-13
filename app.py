@@ -1,11 +1,16 @@
+# MUST BE FIRST - Eventlet monkey patching
+import eventlet
+
+eventlet.monkey_patch()
+
+# Now regular imports
 import os
-from flask import Flask, render_template, Response, jsonify
-from flask_socketio import SocketIO, emit
+from flask import Flask, Response, jsonify, request
+from flask_socketio import SocketIO
 import pickle
 import cv2
 import mediapipe as mp
 import numpy as np
-import eventlet
 import logging
 from flask_cors import CORS
 
@@ -13,13 +18,9 @@ from flask_cors import CORS
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize eventlet
-eventlet.monkey_patch()
-
+# Initialize Flask and SocketIO
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
-
-# Configure Socket.IO
+CORS(app)
 socketio = SocketIO(app,
                     cors_allowed_origins="*",
                     async_mode='eventlet',
@@ -36,7 +37,7 @@ except Exception as e:
     model = None
 
 # Labels dictionary
-labels_dict = {
+LABELS = {
     0: 'A', 1: 'B', 2: 'C', 3: 'D', 4: 'E', 5: 'F', 6: 'G', 7: 'H', 8: 'I', 9: 'J',
     10: 'K', 11: 'L', 12: 'M', 13: 'N', 14: 'O', 15: 'P', 16: 'Q', 17: 'R', 18: 'S',
     19: 'T', 20: 'U', 21: 'V', 22: 'W', 23: 'X', 24: 'Y', 25: 'Z', 26: 'Hello',
@@ -57,86 +58,62 @@ def health_check():
 
 def generate_frames():
     cap = cv2.VideoCapture(0)
-    mp_hands = mp.solutions.hands
-    mp_drawing = mp.solutions.drawing_utils
-    mp_drawing_styles = mp.solutions.drawing_styles
+    hands = mp.solutions.hands.Hands(
+        static_image_mode=True,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5
+    )
 
-    with mp_hands.Hands(
-            static_image_mode=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5) as hands:
+    while True:
+        success, frame = cap.read()
+        if not success:
+            break
 
-        while True:
-            data_aux = []
-            x_ = []
-            y_ = []
+        frame = cv2.flip(frame, 1)
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = hands.process(frame_rgb)
 
-            ret, frame = cap.read()
-            if not ret:
-                logger.warning("Failed to grab frame")
-                break
+        if results.multi_hand_landmarks and model:
+            for landmarks in results.multi_hand_landmarks:
+                # Process landmarks and make prediction
+                data_aux = []
+                x_coords = []
+                y_coords = []
 
-            frame = cv2.flip(frame, 1)
-            H, W, _ = frame.shape
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                for landmark in landmarks.landmark:
+                    x_coords.append(landmark.x)
+                    y_coords.append(landmark.y)
 
-            results = hands.process(frame_rgb)
-            if results.multi_hand_landmarks and model:
-                for hand_landmarks in results.multi_hand_landmarks:
-                    mp_drawing.draw_landmarks(
-                        frame,
-                        hand_landmarks,
-                        mp_hands.HAND_CONNECTIONS,
-                        mp_drawing_styles.get_default_hand_landmarks_style(),
-                        mp_drawing_styles.get_default_hand_connections_style()
-                    )
+                for landmark in landmarks.landmark:
+                    data_aux.append(landmark.x - min(x_coords))
+                    data_aux.append(landmark.y - min(y_coords))
 
-                    for landmark in hand_landmarks.landmark:
-                        x = landmark.x
-                        y = landmark.y
-                        x_.append(x)
-                        y_.append(y)
+                try:
+                    prediction = model.predict([np.asarray(data_aux)])
+                    confidence = max(model.predict_proba([np.asarray(data_aux)])[0])
+                    char = LABELS[int(prediction[0])]
 
-                    for landmark in hand_landmarks.landmark:
-                        x = landmark.x
-                        y = landmark.y
-                        data_aux.append(x - min(x_))
-                        data_aux.append(y - min(y_))
+                    socketio.emit('prediction', {
+                        'text': char,
+                        'confidence': float(confidence)
+                    })
 
-                    x1 = int(min(x_) * W) - 10
-                    y1 = int(min(y_) * H) - 10
-                    x2 = int(max(x_) * W) - 10
-                    y2 = int(max(y_) * H) - 10
+                    # Draw on frame
+                    h, w, _ = frame.shape
+                    x1, y1 = int(min(x_coords) * w) - 10, int(min(y_coords) * h) - 10
+                    x2, y2 = int(max(x_coords) * w) - 10, int(max(y_coords) * h) - 10
 
-                    try:
-                        prediction = model.predict([np.asarray(data_aux)])
-                        prediction_proba = model.predict_proba([np.asarray(data_aux)])
-                        confidence = max(prediction_proba[0])
-                        predicted_character = labels_dict[int(prediction[0])]
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.putText(frame, f"{char} ({confidence * 100:.1f}%)",
+                                (x1, y1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+                except Exception as e:
+                    logger.error(f"Prediction error: {e}")
 
-                        socketio.emit('prediction', {
-                            'text': predicted_character,
-                            'confidence': float(confidence)
-                        })
-
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 0), 4)
-                        cv2.putText(
-                            frame,
-                            f"{predicted_character} ({confidence * 100:.2f}%)",
-                            (x1, y1 - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            1.3,
-                            (0, 0, 0),
-                            3,
-                            cv2.LINE_AA
-                        )
-                    except Exception as e:
-                        logger.error(f"Prediction error: {e}")
-
-            ret, buffer = cv2.imencode('.jpg', frame)
-            frame = buffer.tobytes()
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+        ret, buffer = cv2.imencode('.jpg', frame)
+        frame_bytes = buffer.tobytes()
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
 
 
 @app.route('/video_feed')
@@ -148,7 +125,6 @@ def video_feed():
 @socketio.on('connect')
 def handle_connect():
     logger.info(f"Client connected: {request.sid}")
-    emit('connection_response', {'data': 'Connected'})
 
 
 @socketio.on('disconnect')
